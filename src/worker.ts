@@ -1,0 +1,57 @@
+import { trace } from "@opentelemetry/api";
+import pino from "pino";
+import { closeEvents, declaredSubscriptions, publish, subscribe } from "./events.js";
+import { flags, watchFlags } from "./flags.js";
+
+// A background worker: no web address. It does one unit of work every WORK_INTERVAL_MS
+// (default a minute); replace work() with the app's job. The platform restarts it if it exits.
+const logger = pino({
+  level: process.env.LOG_LEVEL ?? "info",
+});
+
+const serviceName = process.env.OTEL_SERVICE_NAME ?? "swhurl-app";
+const intervalMs = Number.parseInt(process.env.WORK_INTERVAL_MS ?? "60000", 10);
+const tracer = trace.getTracer(serviceName);
+
+async function work(): Promise<void> {
+  await tracer.startActiveSpan("work", async (span) => {
+    try {
+      // An example of publishing: "worked" is described in asyncapi.yaml, which is what lets other
+      // apps find it and subscribe. Off the platform the payload is still checked, and nothing is sent.
+      await publish("worked", { at: new Date().toISOString() });
+      // An example of a feature flag: shout is declared in swhurl.yaml, on in staging only.
+      logger.info({ trace_id: span.spanContext().traceId }, flags.shout ? "WORK DONE" : "work done");
+    } catch (error) {
+      logger.error({ err: error }, "work failed");
+      span.recordException(error as Error);
+    } finally {
+      span.end();
+    }
+  });
+}
+
+// Feature flag overrides set from the console (src/flagstore.ts).
+watchFlags({
+  onChange: (flag, value) => logger.info({ flag, value: value ?? null }, value === undefined ? "flag override cleared" : "flag override set"),
+  onProblem: (error) => logger.warn({ err: error }, "flag overrides"),
+});
+
+const timer = setInterval(() => void work(), intervalMs);
+void work();
+logger.info({ service: serviceName, interval_ms: intervalMs }, "worker started");
+
+// An example of receiving: log every event this app declared it subscribes to (events.subscribe in
+// swhurl.yaml). Each is handled inside the publisher's trace; throw to receive it again.
+for (const name of declaredSubscriptions()) {
+  subscribe(name, (event) => {
+    logger.info({ event_type: event.type, event_id: event.id, source: event.source,
+      trace_id: trace.getActiveSpan()?.spanContext().traceId ?? null }, "event received");
+  }, (error) => logger.warn({ err: error, subscription: name }, "not receiving yet; trying again"));
+}
+
+// Kubernetes sends SIGTERM before stopping the pod.
+process.on("SIGTERM", () => {
+  clearInterval(timer);
+  logger.info("worker stopping");
+  void closeEvents().finally(() => process.exit(0));
+});
